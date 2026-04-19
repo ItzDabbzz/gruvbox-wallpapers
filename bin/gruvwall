@@ -1,0 +1,956 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGRAM_NAME="gruvwall"
+
+die() {
+  printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+has_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+is_tty() {
+  # Backward-compat shim for older callers.
+  # NOTE: despite the name, this answers "can we interact with a user?" and may
+  # return true even when stdin is not a TTY (e.g. when /dev/tty is available).
+  # Prefer has_interactive_input() or has_controlling_tty() for new code.
+  has_interactive_input
+}
+
+has_controlling_tty() {
+  # True if the process has a controlling terminal.
+  # This is stricter than "stdin is a tty".
+  local tty_fd
+  if { exec {tty_fd}<>"/dev/tty"; } 2>/dev/null; then
+    exec {tty_fd}>&-
+    return 0
+  fi
+  return 1
+}
+
+has_interactive_input() {
+  # True if we can prompt the user *somehow*:
+  # - stdin is a TTY (e.g. setsid with stdin still bound to a tty device)
+  # - OR we have a controlling TTY (/dev/tty opens)
+  [[ -t 0 ]] && return 0
+  has_controlling_tty
+}
+
+script_dir() {
+  local src
+  src="${BASH_SOURCE[0]}"
+  (CDPATH='' cd -- "$(dirname -- "$src")" && pwd -P)
+}
+
+resolve_path() {
+  # Prints an absolute path (best-effort).
+  local p="${1-}"
+  [[ -n "$p" ]] || {
+    pwd -P
+    return 0
+  }
+  case "$p" in
+    '~') p="$HOME" ;;
+    '~/'*) p="$HOME/${p#~/}" ;;
+  esac
+
+  local out=""
+  if has_cmd realpath; then
+    if out=$(realpath -m -- "$p" 2>/dev/null); then
+      printf '%s\n' "$out"
+      return 0
+    fi
+  fi
+
+  if has_cmd readlink; then
+    # GNU/coreutils readlink supports -f, but other implementations may not.
+    if out=$(readlink -f -- "$p" 2>/dev/null); then
+      printf '%s\n' "$out"
+      return 0
+    fi
+  fi
+
+  # Fallback: join with pwd if relative (do not fail under set -e).
+  case "$p" in
+    /*) printf '%s\n' "$p" ;;
+    *) printf '%s/%s\n' "$(pwd -P)" "$p" ;;
+  esac
+}
+
+urlencode_path_minimal() {
+  # Minimal percent-encoding for file:// URIs.
+  # Handles spaces and a few common reserved characters.
+  local s="$1"
+  s=${s//'%'/%25}
+  s=${s//' '/%20}
+  s=${s//'#'/%23}
+  s=${s//"'"/%27}
+  s=${s//$'\n'/%0A}
+  printf '%s' "$s"
+}
+
+js_escape_single_quoted_string() {
+  # Escapes a string for inclusion inside a single-quoted JS string literal.
+  # IMPORTANT: this is used for the KDE qdbus evaluateScript fallback.
+  local s="$1" sq bs
+  sq=$'\''
+  bs='\\'
+  s=${s//\\/\\\\}
+  s=${s//"$sq"/$bs$sq}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  printf '%s' "$s"
+}
+
+config_file_path() {
+  printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/gruvwall/config"
+}
+
+# Config keys (parsed from ~/.config/gruvwall/config)
+CFG_WALLPAPER_DIR=""
+CFG_SWWW_ARGS=""
+CFG_LIGHT_GLOBS=() # legacy/ignored (kept for backward compat)
+CFG_DARK_GLOBS=()  # legacy/ignored (kept for backward compat)
+
+SWWW_ARGS_OVERRIDE=""
+
+config_load() {
+  local cfg
+  cfg="$(config_file_path)"
+  [[ -f "$cfg" ]] || return 0
+
+  local line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    [[ "$line" == \#* ]] && continue
+
+    case "$line" in
+      *=*)
+        key=${line%%=*}
+        value=${line#*=}
+        ;;
+      *)
+        continue
+        ;;
+    esac
+
+    # trim simple whitespace around key
+    key=${key#"${key%%[![:space:]]*}"}
+    key=${key%"${key##*[![:space:]]}"}
+
+    # keep value as-is (except CR)
+    value=${value%$'\r'}
+
+    case "$key" in
+      wallpaper_dir)
+        CFG_WALLPAPER_DIR="$value"
+        ;;
+      swww_args)
+        CFG_SWWW_ARGS="$value"
+        ;;
+      light_glob)
+        CFG_LIGHT_GLOBS+=("$value")
+        ;;
+      dark_glob)
+        CFG_DARK_GLOBS+=("$value")
+        ;;
+    esac
+  done <"$cfg"
+}
+
+discover_default_wallpaper_dir() {
+  # Priority (highest to lowest):
+  # 1) flag --wallpaper-dir
+  # 2) env GRUVWALL_WALLPAPER_DIR
+  # 3) config wallpaper_dir
+  # 4) system install (/usr/share/...)
+  # 5) packaged install (../share/... relative to script)
+  # 6) repo checkout (../wallpapers relative to script)
+  local scriptdir
+  scriptdir="$(script_dir)"
+
+  if [[ -n "${GRUVWALL_WALLPAPER_DIR:-}" ]]; then
+    printf '%s\n' "${GRUVWALL_WALLPAPER_DIR}"
+    return 0
+  fi
+
+  if [[ -n "$CFG_WALLPAPER_DIR" ]]; then
+    printf '%s\n' "$CFG_WALLPAPER_DIR"
+    return 0
+  fi
+
+  if [[ -d "/usr/share/gruvbox-wallpapers/wallpapers" ]]; then
+    printf '%s\n' "/usr/share/gruvbox-wallpapers/wallpapers"
+    return 0
+  fi
+
+  if [[ -d "$scriptdir/../share/gruvbox-wallpapers/wallpapers" ]]; then
+    (CDPATH='' cd -- "$scriptdir/../share/gruvbox-wallpapers/wallpapers" && pwd -P)
+    return 0
+  fi
+
+  if [[ -d "$scriptdir/../wallpapers" ]]; then
+    (CDPATH='' cd -- "$scriptdir/../wallpapers" && pwd -P)
+    return 0
+  fi
+
+  # Last resort: repo root (if script lives in bin/)
+  if [[ -d "$scriptdir/.." ]]; then
+    (CDPATH='' cd -- "$scriptdir/.." && pwd -P)
+    return 0
+  fi
+
+  die "could not determine wallpaper directory"
+}
+
+list_all_wallpapers_nul() {
+  local dir="$1"
+  [[ -d "$dir" ]] || die "wallpaper directory not found: $dir"
+
+  if has_cmd fd; then
+    # fd outputs absolute paths with --absolute-path
+    fd --type f --hidden --follow --exclude .git \
+      -e jpg -e jpeg -e png -e webp -e avif -e gif \
+      --absolute-path --print0 . "$dir"
+    return 0
+  fi
+
+  find "$dir" \
+    -type f \
+    \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' -o -iname '*.avif' -o -iname '*.gif' \) \
+    -print0
+}
+
+path_has_light_segment() {
+  # Only matches a /light/ path segment (case-insensitive).
+  local path_lower
+  path_lower="${1,,}"
+  [[ "$path_lower" == */light/* ]]
+}
+
+path_matches_any_glob() {
+  local path="$1"; shift
+  local dir="$1"; shift
+  local g
+
+  shopt -s nullglob globstar
+
+  for g in "$@"; do
+    [[ -n "$g" ]] || continue
+    case "$g" in
+      '~') g="$HOME" ;;
+      '~/'*) g="$HOME/${g#~/}" ;;
+    esac
+    case "$g" in
+      /*)
+        case "$path" in
+          $g) return 0 ;;
+        esac
+        ;;
+      *)
+        # relative to wallpaper dir
+        case "$path" in
+          "$dir"/$g) return 0 ;;
+        esac
+        ;;
+    esac
+  done
+  return 1
+}
+
+filter_wallpapers_by_mode_nul() {
+  # Reads NUL-delimited paths on stdin, writes NUL-delimited paths on stdout.
+  local dir="$1" mode="$2"
+  local p
+
+  if [[ "$mode" == "all" ]]; then
+    cat
+    return 0
+  fi
+
+  case "$mode" in
+    light|dark) ;;
+    *) die "invalid mode: $mode" ;;
+  esac
+
+  while IFS= read -r -d '' p; do
+    if [[ "$mode" == "light" ]]; then
+      path_has_light_segment "$p" || continue
+      printf '%s\0' "$p"
+      continue
+    fi
+
+    # dark: exclude light variants
+    path_has_light_segment "$p" && continue
+    printf '%s\0' "$p"
+  done
+}
+
+print_empty_pool_hint_for_light_mode() {
+  warn "no wallpapers found for light mode (no /light/ variants found); try --mode all"
+}
+
+nul_to_lines() {
+  tr '\0' '\n'
+}
+
+FZF_HELP_CACHE=""
+FZF_HELP_CACHE_READY=0
+
+fzf_load_help_cache() {
+  ((FZF_HELP_CACHE_READY)) && return 0
+  FZF_HELP_CACHE="$(fzf --help 2>&1 || true)"
+  FZF_HELP_CACHE_READY=1
+}
+
+fzf_supports_flag() {
+  local flag="$1"
+  fzf_load_help_cache
+  [[ "$FZF_HELP_CACHE" == *"$flag"* ]]
+}
+
+fzf_supports_read0_print0() {
+  fzf_load_help_cache
+  [[ "$FZF_HELP_CACHE" == *"--read0"* ]] && [[ "$FZF_HELP_CACHE" == *"--print0"* ]]
+}
+
+pick_one_fzf() {
+  local choice=""
+
+  if fzf_supports_read0_print0; then
+    # NUL-safe in/out.
+    if IFS= read -r -d '' choice < <(
+      fzf --read0 --print0 --prompt="${PROGRAM_NAME}> " --height=80% --layout=reverse --border
+    ); then
+      [[ -n "$choice" ]] || return 1
+      printf '%s\n' "$choice"
+      return 0
+    fi
+    return 1
+  fi
+
+  # Fallback: newline mode (older fzf).
+  if ! choice=$(nul_to_lines | fzf --prompt="${PROGRAM_NAME}> " --height=80% --layout=reverse --border); then
+    return 1
+  fi
+  [[ -n "$choice" ]] || return 1
+  printf '%s\n' "$choice"
+}
+
+pick_one_menu() {
+  local list_fd="${1:-0}"
+
+  local -a items=()
+  local p
+  while IFS= read -r -d '' -u "$list_fd" p; do
+    items+=("$p")
+  done
+  ((${#items[@]} > 0)) || return 1
+
+  # NOTE: This function is commonly used in a pipeline and inside command
+  # substitution (e.g. chosen=$(printf ... | pick_one_menu)). That means:
+  # - stdin is consumed by the pipe (for the item list)
+  # - stdout is captured (must contain ONLY the selected path)
+  # So the menu UI must talk to the terminal via /dev/tty when available.
+
+  local menu_fd=2
+  local menu_fd_opened=0
+  if { exec {menu_fd}>"/dev/tty"; } 2>/dev/null; then
+    menu_fd_opened=1
+  else
+    menu_fd=2
+  fi
+
+  local input_fd
+  local input_fd_opened=0
+  if { exec {input_fd}<"/dev/tty"; } 2>/dev/null; then
+    input_fd_opened=1
+  else
+    input_fd=""
+  fi
+
+  if [[ -z "${input_fd}" ]]; then
+    if [[ -t 0 ]]; then
+      input_fd=0
+    else
+      die "no interactive TTY available for menu selection; install fzf or use --set FILE / --random"
+    fi
+  fi
+
+  local i
+  for i in "${!items[@]}"; do
+    printf '%4d) %s\n' "$((i + 1))" "${items[$i]}" >&"$menu_fd"
+  done
+
+  local n
+  printf 'Select a number (empty to cancel): ' >&"$menu_fd"
+  if ! IFS= read -r -u "$input_fd" n; then
+    ((menu_fd_opened)) && exec {menu_fd}>&-
+    ((input_fd_opened)) && exec {input_fd}<&-
+    return 1
+  fi
+  [[ -n "$n" ]] || {
+    ((menu_fd_opened)) && exec {menu_fd}>&-
+    ((input_fd_opened)) && exec {input_fd}<&-
+    return 1
+  }
+  [[ "$n" =~ ^[0-9]+$ ]] || die "invalid selection: $n"
+  ((n >= 1 && n <= ${#items[@]})) || die "selection out of range: $n"
+  ((menu_fd_opened)) && exec {menu_fd}>&-
+  ((input_fd_opened)) && exec {input_fd}<&-
+  printf '%s\n' "${items[$((n - 1))]}"
+}
+
+pick_one_random() {
+  # Reservoir sampling over NUL-delimited input.
+  local chosen=""
+  local seen=0
+  local p
+  while IFS= read -r -d '' p; do
+    ((seen++))
+    if ((RANDOM % seen == 0)); then
+      chosen="$p"
+    fi
+  done
+  [[ -n "$chosen" ]] || return 1
+  printf '%s\n' "$chosen"
+}
+
+is_hyprland_session() {
+  [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] && return 0
+  [[ "${XDG_CURRENT_DESKTOP:-}" =~ [Hh]yprland ]] && return 0
+  [[ "${XDG_SESSION_DESKTOP:-}" =~ [Hh]yprland ]] && return 0
+  return 1
+}
+
+is_kde_session() {
+  [[ "${XDG_CURRENT_DESKTOP:-}" =~ KDE ]] && return 0
+  [[ "${XDG_SESSION_DESKTOP:-}" =~ KDE ]] && return 0
+  [[ -n "${KDE_FULL_SESSION:-}" ]] && return 0
+  return 1
+}
+
+mode_from_scheme_name() {
+  # Input: a (possibly empty) colorscheme name. Output: light|dark
+  local name_lower
+  name_lower="${1,,}"
+
+  [[ -n "$name_lower" ]] || {
+    printf '%s\n' "dark"
+    return 0
+  }
+
+  if [[ "$name_lower" == *dark* ]]; then
+    printf '%s\n' "dark"
+    return 0
+  fi
+  if [[ "$name_lower" == *light* ]]; then
+    printf '%s\n' "light"
+    return 0
+  fi
+
+  printf '%s\n' "dark"
+}
+
+kde_detect_mode() {
+  local kdeglobals
+  kdeglobals="${XDG_CONFIG_HOME:-$HOME/.config}/kdeglobals"
+  [[ -f "$kdeglobals" ]] || {
+    printf '%s\n' "dark"
+    return 0
+  }
+
+  local scheme=""
+  if has_cmd kreadconfig6; then
+    scheme="$(kreadconfig6 --file "$kdeglobals" --group General --key ColorScheme 2>/dev/null || true)"
+  elif has_cmd kreadconfig5; then
+    scheme="$(kreadconfig5 --file "$kdeglobals" --group General --key ColorScheme 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$scheme" ]]; then
+    # Fallback parser (no external tools): read ColorScheme from [General]
+    local in_general=0 line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line=${line%$'\r'}
+      case "$line" in
+        '[General]') in_general=1; continue ;;
+        '\['*'\]') in_general=0; continue ;;
+      esac
+      if ((in_general)) && [[ "$line" == ColorScheme=* ]]; then
+        scheme="${line#ColorScheme=}"
+        break
+      fi
+    done <"$kdeglobals"
+  fi
+
+  mode_from_scheme_name "$scheme"
+}
+
+hyprland_detect_mode() {
+  if has_cmd gsettings; then
+    # prefer-dark | default
+    local gs sq
+    gs="$(gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null || true)"
+    sq=$'\''
+    gs=${gs//"$sq"/}
+    gs=${gs,,}
+    if [[ "$gs" == *dark* ]]; then
+      printf '%s\n' "dark"
+      return 0
+    fi
+    if [[ "$gs" == *light* ]]; then
+      printf '%s\n' "light"
+      return 0
+    fi
+  fi
+
+  local gtk_settings
+  gtk_settings="${XDG_CONFIG_HOME:-$HOME/.config}/gtk-3.0/settings.ini"
+  [[ -f "$gtk_settings" ]] || {
+    printf '%s\n' "dark"
+    return 0
+  }
+
+  local in_settings=0 line value=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}
+    case "$line" in
+      '[Settings]') in_settings=1; continue ;;
+      '\['*'\]') in_settings=0; continue ;;
+    esac
+    if ((in_settings)) && [[ "$line" == gtk-application-prefer-dark-theme=* ]]; then
+      value="${line#gtk-application-prefer-dark-theme=}"
+      value="${value,,}"
+      break
+    fi
+  done <"$gtk_settings"
+
+  case "$value" in
+    1|true|yes|on) printf '%s\n' "dark" ;;
+    0|false|no|off) printf '%s\n' "light" ;;
+    *) printf '%s\n' "dark" ;;
+  esac
+}
+
+autodetect_mode() {
+  # Output: light|dark
+  if is_kde_session; then
+    kde_detect_mode
+    return 0
+  fi
+
+  if is_hyprland_session; then
+    hyprland_detect_mode
+    return 0
+  fi
+
+  printf '%s\n' "dark"
+}
+
+normalize_mode() {
+  local m
+  m="${1,,}"
+  case "$m" in
+    light|dark|all|auto) printf '%s\n' "$m" ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_effective_mode() {
+  # Input: light|dark|all|auto
+  # Output: light|dark|all
+  local requested="$1"
+  case "$requested" in
+    auto)
+      autodetect_mode
+      ;;
+    light|dark|all)
+      printf '%s\n' "$requested"
+      ;;
+    *)
+      die "invalid mode: $requested"
+      ;;
+  esac
+}
+
+kde_set_wallpaper() {
+  local file="$1"
+  local abs
+  abs="$(resolve_path "$file")"
+  [[ -f "$abs" ]] || die "file not found: $file"
+
+  if has_cmd plasma-apply-wallpaperimage; then
+    plasma-apply-wallpaperimage "$abs"
+    return 0
+  fi
+
+  local qdbus_bin=""
+  if has_cmd qdbus6; then
+    qdbus_bin=qdbus6
+  elif has_cmd qdbus; then
+    qdbus_bin=qdbus
+  else
+    die "KDE backend requires plasma-apply-wallpaperimage or qdbus6/qdbus"
+  fi
+
+  local uri js escaped_uri
+  uri="file://$(urlencode_path_minimal "$abs")"
+  escaped_uri="$(js_escape_single_quoted_string "$uri")"
+
+  # NOTE: Keep script on one line for qdbus argument handling.
+  js="var allDesktops = desktops(); for (var i=0; i<allDesktops.length; i++) { var d = allDesktops[i]; d.wallpaperPlugin = 'org.kde.image'; d.currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General']; d.writeConfig('Image', '${escaped_uri}'); }"
+  "$qdbus_bin" org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "$js" >/dev/null
+}
+
+swww_is_running() {
+  has_cmd swww || return 1
+  swww query >/dev/null 2>&1
+}
+
+swww_ensure_running() {
+  has_cmd swww || return 1
+  swww_is_running && return 0
+  # Best-effort: init spawns the daemon.
+  swww init >/dev/null 2>&1 || return 1
+  swww_is_running
+}
+
+swww_set_wallpaper() {
+  local file="$1"
+  local abs
+  abs="$(resolve_path "$file")"
+  [[ -f "$abs" ]] || die "file not found: $file"
+
+  swww_ensure_running || die "swww is not running (try starting it, or use --backend hyprpaper)"
+
+  local default_args=(
+    --transition-type grow
+    --transition-fps 60
+    --transition-duration 1
+    --transition-bezier .43,1.19,1,.4
+  )
+
+  local args_string
+  args_string="${SWWW_ARGS_OVERRIDE:-${GRUVWALL_SWWW_ARGS:-${CFG_SWWW_ARGS:-}}}"
+
+  if [[ -n "$args_string" ]]; then
+    # Split on whitespace; no quoting support (documented in README).
+    # shellcheck disable=SC2206
+    local extra_args=( $args_string )
+    swww img "$abs" "${extra_args[@]}"
+    return 0
+  fi
+
+  swww img "$abs" "${default_args[@]}"
+}
+
+hyprpaper_monitors() {
+  # Prints monitor names, one per line.
+  has_cmd hyprctl || return 1
+
+  if has_cmd jq; then
+    hyprctl monitors -j 2>/dev/null | jq -r '.[].name' 2>/dev/null || true
+    return 0
+  fi
+
+  # Best-effort parsing without jq.
+  # Lines look like: "Monitor eDP-1 (ID 0): ..."
+  hyprctl monitors 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      Monitor\ *)
+        line=${line#Monitor }
+        printf '%s\n' "${line%% *}"
+        ;;
+    esac
+  done
+}
+
+hyprpaper_set_wallpaper() {
+  local file="$1"
+  local abs
+  abs="$(resolve_path "$file")"
+  [[ -f "$abs" ]] || die "file not found: $file"
+
+  has_cmd hyprctl || die "hyprpaper backend requires hyprctl"
+
+  # If hyprpaper isn't running, these commands will fail.
+  hyprctl hyprpaper preload "$abs" >/dev/null 2>&1 || die "hyprpaper does not appear to be running"
+
+  local -a monitors=()
+  local m
+  while IFS= read -r m; do
+    [[ -n "$m" ]] || continue
+    monitors+=("$m")
+  done < <(hyprpaper_monitors)
+
+  if ((${#monitors[@]} == 0)); then
+    # Fallback: apply "all" (Hyprpaper accepts empty monitor as all in some versions;
+    # if not, this will at least set something rather than silently doing nothing).
+    hyprctl hyprpaper wallpaper ",$abs" >/dev/null 2>&1 || die "failed to apply wallpaper via hyprpaper"
+    return 0
+  fi
+
+  for m in "${monitors[@]}"; do
+    hyprctl hyprpaper wallpaper "$m,$abs" >/dev/null 2>&1 || die "failed to apply wallpaper via hyprpaper (monitor: $m)"
+  done
+}
+
+autodetect_backend() {
+  if [[ -n "${GRUVWALL_BACKEND:-}" ]]; then
+    printf '%s\n' "${GRUVWALL_BACKEND}"
+    return 0
+  fi
+
+  if is_hyprland_session; then
+    if swww_is_running; then
+      printf '%s\n' "swww"
+      return 0
+    fi
+    if has_cmd hyprctl && hyprctl hyprpaper listloaded >/dev/null 2>&1; then
+      printf '%s\n' "hyprpaper"
+      return 0
+    fi
+
+    if has_cmd swww; then
+      printf '%s\n' "swww"
+      return 0
+    fi
+    if has_cmd hyprctl; then
+      printf '%s\n' "hyprpaper"
+      return 0
+    fi
+
+    die "Hyprland detected, but neither swww nor hyprctl is available"
+  fi
+
+  if is_kde_session; then
+    printf '%s\n' "kde"
+    return 0
+  fi
+
+  die "unsupported session (not Hyprland and not KDE); use --backend kde|swww|hyprpaper"
+}
+
+apply_backend() {
+  local backend="$1" file="$2"
+  case "$backend" in
+    kde) kde_set_wallpaper "$file" ;;
+    swww) swww_set_wallpaper "$file" ;;
+    hyprpaper) hyprpaper_set_wallpaper "$file" ;;
+    *) die "unknown backend: $backend" ;;
+  esac
+}
+
+usage() {
+  cat <<'EOF'
+gruvwall - browse/select/apply gruvbox wallpapers (KDE Plasma Wayland + Hyprland)
+
+Usage:
+  gruvwall --list [--mode light|dark|all|auto] [--wallpaper-dir DIR]
+  gruvwall --pick [--mode light|dark|all|auto] [--backend kde|swww|hyprpaper] [--print]
+  gruvwall --random [--mode light|dark|all|auto] [--backend kde|swww|hyprpaper] [--print]
+  gruvwall --set FILE [--backend kde|swww|hyprpaper] [--print]
+
+Options:
+  --mode MODE           Filter pool:
+                          - light: ONLY files under a /light/ path segment
+                          - dark:  EXCLUDE files under a /light/ path segment
+                          - all:   include everything
+                          - auto:  detect light/dark from desktop settings (default)
+  --backend BACKEND     Override backend: kde|swww|hyprpaper
+  --wallpaper-dir DIR   Override wallpaper directory
+  --swww-args "ARGS"     Override swww args (split on whitespace)
+  --print               Print chosen path and exit (do not apply)
+  --help, -h            Show help
+
+Config (optional):
+  ~/.config/gruvwall/config
+    wallpaper_dir=/path/to/wallpapers
+    swww_args=--transition-type grow --transition-duration 1
+
+Environment overrides:
+  GRUVWALL_MODE, GRUVWALL_WALLPAPER_DIR, GRUVWALL_BACKEND, GRUVWALL_SWWW_ARGS
+EOF
+}
+
+main() {
+  local action=""
+  local mode_input="auto"
+  local mode_set=0
+  local backend=""
+  local print_only=0
+  local set_file=""
+  local wallpaper_dir_flag=""
+  local swww_args_flag=""
+
+  if (($# == 0)); then
+    usage
+    exit 2
+  fi
+
+  while (($# > 0)); do
+    case "$1" in
+      --help|-h)
+        usage
+        return 0
+        ;;
+      --list)
+        [[ -z "$action" ]] || die "only one of --list/--pick/--random/--set is allowed"
+        action="list"
+        ;;
+      --pick)
+        [[ -z "$action" ]] || die "only one of --list/--pick/--random/--set is allowed"
+        action="pick"
+        ;;
+      --random)
+        [[ -z "$action" ]] || die "only one of --list/--pick/--random/--set is allowed"
+        action="random"
+        ;;
+      --set)
+        [[ -z "$action" ]] || die "only one of --list/--pick/--random/--set is allowed"
+        action="set"
+        shift
+        (($# > 0)) || die "--set requires a file path"
+        set_file="$1"
+        ;;
+      --print)
+        print_only=1
+        ;;
+      --mode)
+        shift
+        (($# > 0)) || die "--mode requires light|dark|all|auto"
+        mode_input="$1"
+        mode_set=1
+        ;;
+      --backend)
+        shift
+        (($# > 0)) || die "--backend requires kde|swww|hyprpaper"
+        backend="$1"
+        ;;
+      --wallpaper-dir)
+        shift
+        (($# > 0)) || die "--wallpaper-dir requires a directory"
+        wallpaper_dir_flag="$1"
+        ;;
+      --swww-args)
+        shift
+        (($# > 0)) || die "--swww-args requires a string"
+        swww_args_flag="$1"
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+    shift
+  done
+
+  if ((mode_set == 0)) && [[ -n "${GRUVWALL_MODE:-}" ]]; then
+    mode_input="${GRUVWALL_MODE}"
+  fi
+
+  local normalized_mode_input
+  normalized_mode_input="$(normalize_mode "$mode_input" 2>/dev/null || true)"
+  [[ -n "$normalized_mode_input" ]] || die "invalid --mode: $mode_input"
+
+  local mode
+  mode="$(resolve_effective_mode "$normalized_mode_input")"
+
+  if [[ -n "$backend" ]]; then
+    case "$backend" in
+      kde|swww|hyprpaper) ;;
+      *) die "invalid --backend: $backend" ;;
+    esac
+  fi
+
+  config_load
+
+  local wallpaper_dir
+  if [[ -n "$wallpaper_dir_flag" ]]; then
+    wallpaper_dir="$wallpaper_dir_flag"
+  else
+    wallpaper_dir="$(discover_default_wallpaper_dir)"
+  fi
+  wallpaper_dir="$(resolve_path "$wallpaper_dir")"
+
+  if [[ -n "$swww_args_flag" ]]; then
+    SWWW_ARGS_OVERRIDE="$swww_args_flag"
+  fi
+
+  case "$action" in
+    list)
+      list_all_wallpapers_nul "$wallpaper_dir" \
+        | filter_wallpapers_by_mode_nul "$wallpaper_dir" "$mode" \
+        | nul_to_lines
+      return 0
+      ;;
+    set)
+      local chosen
+      chosen="$(resolve_path "$set_file")"
+      [[ -f "$chosen" ]] || die "file not found: $set_file"
+      if ((print_only)); then
+        printf '%s\n' "$chosen"
+        return 0
+      fi
+      local final_backend
+      final_backend="${backend:-$(autodetect_backend)}"
+      apply_backend "$final_backend" "$chosen"
+      return 0
+      ;;
+    pick|random)
+      local -a pool=()
+      local p
+      while IFS= read -r -d '' p; do
+        pool+=("$p")
+      done < <(list_all_wallpapers_nul "$wallpaper_dir" | filter_wallpapers_by_mode_nul "$wallpaper_dir" "$mode")
+
+      if ((${#pool[@]} == 0)); then
+        if [[ "$mode" == "light" ]]; then
+          print_empty_pool_hint_for_light_mode
+          return 0
+        fi
+        die "no wallpapers found"
+      fi
+
+      local chosen=""
+      if [[ "$action" == "random" ]]; then
+        # Feed NUL-delimited list to reservoir sampler.
+        chosen=$(printf '%s\0' "${pool[@]}" | pick_one_random) || die "failed to pick a random wallpaper"
+      else
+        if ! has_interactive_input; then
+          die "no interactive input available for --pick (use --set FILE or --random --print)"
+        fi
+
+        # fzf needs a controlling TTY when fed via a pipe.
+        if has_controlling_tty && has_cmd fzf; then
+          chosen=$(printf '%s\0' "${pool[@]}" | pick_one_fzf) || die "no selection"
+        else
+          # Keep stdin intact so menu can fall back to reading from fd 0 when
+          # /dev/tty isn't available.
+          chosen=$(pick_one_menu 3 3< <(printf '%s\0' "${pool[@]}")) || die "no selection"
+        fi
+      fi
+
+      if ((print_only)); then
+        printf '%s\n' "$chosen"
+        return 0
+      fi
+
+      local final_backend
+      final_backend="${backend:-$(autodetect_backend)}"
+      apply_backend "$final_backend" "$chosen"
+      return 0
+      ;;
+    *)
+      die "missing action: use --list, --pick, --random, or --set"
+      ;;
+  esac
+}
+
+main "$@"
